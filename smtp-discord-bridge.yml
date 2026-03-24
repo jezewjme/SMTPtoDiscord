@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  smtp-bridge:
+    image: axllent/mailpit
+    container_name: smtp-discord-bridge
+    ports:
+      - "25:1025"  # SMTP port
+      - "8025:8025"  # Web UI port
+    environment:
+      - MP_SMTP_BIND_ADDR=0.0.0.0:1025
+      - MP_WEB_BIND_ADDR=0.0.0.0:8025
+    volumes:
+      - /home/smtp-discord-bridge/mailpit:/data
+    networks:
+      - smtp-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8025/api/v1/messages"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  discord-forwarder:
+    build:
+      context: .
+      dockerfile: Dockerfile.forwarder
+    container_name: discord-email-forwarder
+    environment:
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+    networks:
+      - smtp-network
+    depends_on:
+      smtp-bridge:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  smtp-network:
+    driver: bridge 

@@ -1,0 +1,215 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Create the forwarder script
+COPY <<EOF /app/forwarder.py
+import os
+import time
+import json
+import requests
+from datetime import datetime
+
+print("Starting forwarder script...")
+
+# Collect all Discord webhook URLs from environment variables
+DISCORD_WEBHOOKS = {}
+DEFAULT_DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL')
+
+# Find all environment variables that start with DISCORD_WEBHOOK_URL
+for key, value in os.environ.items():
+    if key.startswith('DISCORD_WEBHOOK_URL'):
+        if key == 'DISCORD_WEBHOOK_URL':
+            continue  # Skip the default one, we handle it separately
+        # Extract the suffix after DISCORD_WEBHOOK_URL_
+        if key.startswith('DISCORD_WEBHOOK_URL_'):
+            suffix = key[len('DISCORD_WEBHOOK_URL_'):].lower()
+            DISCORD_WEBHOOKS[suffix] = value
+            print(f"Found webhook for '{suffix}': configured")
+
+print(f"Default Discord Webhook URL configured: {'Yes' if DEFAULT_DISCORD_WEBHOOK_URL else 'No'}")
+print(f"Found {len(DISCORD_WEBHOOKS)} additional webhook URLs")
+
+MAILPIT_API_URL = 'http://smtp-bridge:8025/api/v1'
+
+def format_address(address):
+    """Format email address for display."""
+    if isinstance(address, dict):
+        name = address.get('Name', '').strip()
+        addr = address.get('Address', '')
+        if name:
+            return f"{name} <{addr}>"
+        return addr
+    elif isinstance(address, list):
+        return ", ".join(format_address(addr) for addr in address)
+    return str(address)
+
+def sanitize_text(text):
+    """Sanitize text for Discord."""
+    if not text:
+        return "No content"
+    
+    # Clean up extra whitespace and truncate if needed
+    text = text.strip()
+    
+    # Truncate if too long (Discord has a 2000 character limit for description)
+    if len(text) > 1900:
+        text = text[:1900] + "..."
+    return text
+
+def get_webhook_url_for_email(to_addresses):
+    """Get the appropriate Discord webhook URL based on TO address."""
+    if not to_addresses:
+        return DEFAULT_DISCORD_WEBHOOK_URL
+    
+    # Handle both single address and list of addresses
+    if isinstance(to_addresses, list):
+        addresses = to_addresses
+    else:
+        addresses = [to_addresses]
+    
+    # Check each TO address
+    for address in addresses:
+        if isinstance(address, dict):
+            email_addr = address.get('Address', '')
+        else:
+            email_addr = str(address)
+        
+        if '@' in email_addr:
+            username = email_addr.split('@')[0].lower()
+            if username in DISCORD_WEBHOOKS:
+                print(f"Found matching webhook for username: {username}")
+                return DISCORD_WEBHOOKS[username]
+    
+    # If no match found, use default
+    print("No matching webhook found, using default")
+    return DEFAULT_DISCORD_WEBHOOK_URL
+
+def create_discord_embed(email):
+    """Create a Discord embed from email data."""
+    subject = email.get('Subject', 'No Subject')
+    from_addr = format_address(email.get('From', 'Unknown'))
+    to_addr = format_address(email.get('To', 'Unknown'))
+    date = email.get('Date', datetime.now().isoformat())
+    text_content = email.get('Text', '')
+    
+    # Use only text content from emails
+    content = sanitize_text(text_content)
+    
+    return {
+        "title": f"New Email: {subject}",
+        "color": 3447003,  # Blue color
+        "fields": [
+            {
+                "name": "From",
+                "value": from_addr,
+                "inline": True
+            },
+            {
+                "name": "To",
+                "value": to_addr,
+                "inline": True
+            },
+            {
+                "name": "Date",
+                "value": date,
+                "inline": True
+            }
+        ],
+        "description": content
+    }
+
+def send_to_discord(email):
+    """Send email content to Discord webhook."""
+    try:
+        # Get the appropriate webhook URL based on TO address
+        webhook_url = get_webhook_url_for_email(email.get('To'))
+        
+        if not webhook_url:
+            print("No webhook URL available, skipping Discord notification")
+            return
+        
+        embed = create_discord_embed(email)
+        print(f"Attempting to send to Discord: {email.get('Subject', 'No Subject')}")
+        
+        payload = {
+            "embeds": [embed]
+        }
+        
+        # Debug print the payload
+        print(f"Payload: {json.dumps(payload, indent=2)}")
+        
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'}
+        )
+        response.raise_for_status()
+        print(f"Successfully forwarded email to Discord: {email.get('Subject', 'No Subject')}")
+    except Exception as e:
+        print(f"Error forwarding to Discord: {str(e)}")
+        if hasattr(e, 'response'):
+            print(f"Response content: {e.response.text}")
+
+def get_new_messages():
+    """Get new messages from Mailpit API."""
+    try:
+        print("Checking for new messages...")
+        response = requests.get(f"{MAILPIT_API_URL}/messages")
+        response.raise_for_status()
+        data = response.json()
+        messages = data.get('messages', [])
+        print(f"Found {len(messages)} messages")
+        return messages
+    except Exception as e:
+        print(f"Error fetching messages: {str(e)}")
+        return []
+
+def main():
+    print("Starting email to Discord forwarder...")
+    print(f"Mailpit API URL: {MAILPIT_API_URL}")
+    processed_ids = set()
+    
+    while True:
+        try:
+            messages = get_new_messages()
+            
+            for message in messages:
+                message_id = message.get('ID')
+                
+                if message_id not in processed_ids:
+                    # Get full message details
+                    try:
+                        print(f"Processing message ID: {message_id}")
+                        response = requests.get(f"{MAILPIT_API_URL}/message/{message_id}")
+                        response.raise_for_status()
+                        email_data = response.json()
+                        send_to_discord(email_data)
+                        processed_ids.add(message_id)
+                    except Exception as e:
+                        print(f"Error processing message {message_id}: {str(e)}")
+            
+            # Keep only the last 1000 processed IDs to prevent memory growth
+            if len(processed_ids) > 1000:
+                processed_ids = set(list(processed_ids)[-1000:])
+                
+        except Exception as e:
+            print(f"Error in main loop: {str(e)}")
+        
+        time.sleep(10)  # Check for new messages every 10 seconds
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# Create requirements.txt
+COPY <<EOF /app/requirements.txt
+requests==2.31.0
+EOF
+
+# Install dependencies and verify
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -c "import requests; print('Requests package installed successfully')"
+
+# Run the forwarder
+CMD ["python", "-u", "forwarder.py"] 
